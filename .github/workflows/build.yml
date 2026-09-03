@@ -1,0 +1,40 @@
+name: Build standalone Windows EXE
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate embedded PowerShell header
+        shell: pwsh
+        run: python build/generate_embedded_header.py
+
+      - name: Build standalone x64 EXE
+        shell: cmd
+        run: |
+          if not exist dist mkdir dist
+          clang --target=x86_64-pc-windows-msvc -fshort-wchar -ffreestanding -fno-stack-protector -fno-builtin -Oz -c src\standalone_launcher.c -o dist\standalone_launcher.obj
+          lld-link dist\standalone_launcher.obj /entry:WinMainCRTStartup /subsystem:windows /nodefaultlib /machine:x64 /out:dist\FS25_MFG_Unlocker.exe
+          del dist\standalone_launcher.obj
+
+      - name: SHA-256
+        shell: pwsh
+        run: |
+          (Get-FileHash dist/FS25_MFG_Unlocker.exe -Algorithm SHA256).Hash | Out-File -Encoding ascii dist/FS25_MFG_Unlocker.exe.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FS25_MFG_Unlocker-Windows-x64
+          path: |
+            dist/FS25_MFG_Unlocker.exe
+            dist/FS25_MFG_Unlocker.exe.sha256
