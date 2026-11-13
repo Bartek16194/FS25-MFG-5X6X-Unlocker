@@ -351,6 +351,61 @@ function Apply-PatchBytes([byte[]]$Data, [bool]$Forward) {
     Write-Output -NoEnumerate $Data
 }
 
+# Hash in-memory bytes without a second path-based file open.
+function Get-BytesSHA256([byte[]]$Data) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($Data))).Replace('-','') }
+    finally { $sha.Dispose() }
+}
+
+# Hold an exclusive handle from the identity check through the final write.
+# If the write fails, restore exactly the bytes read under the SAME lock.
+# This avoids the hash-then-Copy-Item race with a Steam update.
+function Write-VerifiedLockedFile([string]$Target, [string]$ExpectedHash, [byte[]]$Replacement) {
+    if (-not $Replacement -or [string]::IsNullOrWhiteSpace($ExpectedHash)) {
+        throw 'Verified write requires an expected SHA-256 and nonempty replacement bytes.'
+    }
+    $stream = [IO.File]::Open($Target, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try {
+        if ($stream.Length -gt [int]::MaxValue) { throw 'Target file is too large for verified write.' }
+        [byte[]]$original = New-Object byte[] ([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $original.Length) {
+            $count = $stream.Read($original, $offset, $original.Length - $offset)
+            if ($count -le 0) { throw 'Cannot read target through exclusive file handle.' }
+            $offset += $count
+        }
+        if ((Get-BytesSHA256 $original) -ne $ExpectedHash.ToUpperInvariant()) {
+            throw 'Target changed before exclusive write. No changes were made.'
+        }
+        $replacementHash = Get-BytesSHA256 $Replacement
+        try {
+            $stream.Position = 0
+            $stream.SetLength($Replacement.Length)
+            $stream.Write($Replacement, 0, $Replacement.Length)
+            $stream.Flush($true)
+            $stream.Position = 0
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            try { $writtenHash = ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-','') }
+            finally { $sha.Dispose() }
+            if ($writtenHash -ne $replacementHash) { throw 'Written file checksum mismatch.' }
+        } catch {
+            $writeError = $_.Exception.Message
+            try {
+                $stream.Position = 0
+                $stream.SetLength($original.Length)
+                $stream.Write($original, 0, $original.Length)
+                $stream.Flush($true)
+            } catch {
+                throw "Write failed ($writeError). In-handle restore FAILED; use verified backup: $($_.Exception.Message)"
+            }
+            throw "Write failed and original bytes restored: $writeError"
+        }
+    } finally {
+        $stream.Dispose()
+    }
+}
+
 function Backup-CurrentFile([string]$Source, [string]$Backup) {
     if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { throw "Source file missing: $Source" }
     $srcHash = Get-SHA256 $Source
@@ -1048,6 +1103,7 @@ $install.Add_Click({
         $script:PatchDefinition = $liveProbe.Definition
         Log-Line ("Verified original FS25 build {0}; exact SHA-256 and all patch bytes match." -f $versionInfo.Version) $accent
 
+        $beforeXmlHash = Get-SHA256 $script:CurrentGameXml
         $exeBak = "$script:CurrentExe.mfg56.bak"
         [void](Backup-CurrentFile $script:CurrentExe $exeBak)
         Log-Line 'Exact pre-patch executable backup created and hash recorded.' $accent
@@ -1064,11 +1120,17 @@ $install.Add_Click({
         Write-DevControlsUnlock $script:CurrentGameXml $xmlTmp
         if ((Get-DevControlsState $xmlTmp) -ne 'enabled') { throw 'Development-controls game.xml validation failed.' }
 
-        if ((Get-SHA256 $script:CurrentExe) -ne $beforeHash) { throw 'Game EXE changed during patch preparation. No patch written.' }
-        Copy-Item -LiteralPath $exeTmp -Destination $script:CurrentExe -Force
-        $exeWritten = $true
-        Copy-Item -LiteralPath $xmlTmp -Destination $script:CurrentGameXml -Force
+        # Validate backups before either guarded write. Apply XML first so an EXE write
+        # is never followed by another required, unguarded file replacement.
+        if ((Get-SHA256 $exeBak) -ne $beforeHash -or (Get-SHA256 $xmlBak) -ne $beforeXmlHash) {
+            throw 'Pre-patch backups do not match verified input files.'
+        }
+        $patchedExeHash = Get-SHA256 $exeTmp
+        $patchedXmlHash = Get-SHA256 $xmlTmp
+        Write-VerifiedLockedFile $script:CurrentGameXml $beforeXmlHash ([IO.File]::ReadAllBytes($xmlTmp))
         $xmlWritten = $true
+        Write-VerifiedLockedFile $script:CurrentExe $beforeHash ([IO.File]::ReadAllBytes($exeTmp))
+        $exeWritten = $true
         if ((Get-PatchLayoutState $script:CurrentExe) -ne 'patched-compatible') { throw 'Final executable verification failed.' }
         if ((Get-DevControlsState $script:CurrentGameXml) -ne 'enabled') { throw 'Final game.xml verification failed.' }
 
@@ -1091,13 +1153,18 @@ $install.Add_Click({
     } catch {
         Remove-Item -LiteralPath $exeTmp -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $xmlTmp -Force -ErrorAction SilentlyContinue
-        # Best-effort rollback only for files actually replaced during this attempt.
-        try {
-            $exeBak = "$script:CurrentExe.mfg56.bak"
-            if ($exeWritten -and (Test-Path -LiteralPath $exeBak)) { Copy-Item -LiteralPath $exeBak -Destination $script:CurrentExe -Force }
-            $xmlBak = "$script:CurrentGameXml.mfg56.bak"
-            if ($xmlWritten -and (Test-Path -LiteralPath $xmlBak)) { Copy-Item -LiteralPath $xmlBak -Destination $script:CurrentGameXml -Force }
-        } catch {}
+        # Never roll back over an updater's newer file. Only restore our exact
+        # recorded output under an exclusive lock; otherwise leave it untouched.
+        if ($exeWritten -and (Test-Path -LiteralPath "$script:CurrentExe.mfg56.bak")) {
+            try {
+                Write-VerifiedLockedFile $script:CurrentExe $patchedExeHash ([IO.File]::ReadAllBytes("$script:CurrentExe.mfg56.bak"))
+            } catch { Log-Line ("EXE rollback skipped/failed: " + $_.Exception.Message) $red }
+        }
+        if ($xmlWritten -and (Test-Path -LiteralPath "$script:CurrentGameXml.mfg56.bak")) {
+            try {
+                Write-VerifiedLockedFile $script:CurrentGameXml $patchedXmlHash ([IO.File]::ReadAllBytes("$script:CurrentGameXml.mfg56.bak"))
+            } catch { Log-Line ("game.xml rollback skipped/failed: " + $_.Exception.Message) $red }
+        }
         Log-Line ("ERROR: " + $_.Exception.Message) $red
         Refresh-Status
         [Windows.Forms.MessageBox]::Show($_.Exception.Message,$AppName,[Windows.Forms.MessageBoxButtons]::OK,[Windows.Forms.MessageBoxIcon]::Error) | Out-Null
