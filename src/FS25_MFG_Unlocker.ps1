@@ -291,6 +291,16 @@ function Get-PatchMatchSummary([string]$ExePath) {
     return @{ Old=$oldCount; New=$newCount; Unknown=$unknownCount; Total=$total }
 }
 
+# Refuse to patch anything except a byte-for-byte known original executable.
+# A partial signature match is diagnostic only, never permission to write.
+function Test-TrustedPatch($Probe, $VersionInfo, [string]$ExeHash) {
+    if (-not $Probe -or $Probe.State -ne 'original-compatible' -or -not $Probe.Definition) { return $false }
+    if (-not $VersionInfo -or [string]::IsNullOrWhiteSpace($VersionInfo.Version)) { return $false }
+    if ([string]::IsNullOrWhiteSpace($ExeHash) -or [string]::IsNullOrWhiteSpace($Probe.Definition.OriginalHash)) { return $false }
+    return ($VersionInfo.Version -eq $Probe.Definition.Version -and
+            $ExeHash -eq $Probe.Definition.OriginalHash)
+}
+
 function Test-BasicPeFile([string]$ExePath) {
     try {
         [byte[]]$head = New-Object byte[] 64
@@ -336,15 +346,6 @@ function Apply-PatchBytes([byte[]]$Data, [bool]$Forward) {
                 throw "Compatibility check failed at 0x$((($p.Offset + $i)).ToString('X')). No changes were written."
             }
         }
-        [Array]::Copy($replace, 0, $Data, $p.Offset, $replace.Length)
-    }
-    Write-Output -NoEnumerate $Data
-}
-
-function Apply-PatchBytesForce([byte[]]$Data) {
-    foreach ($p in $script:PatchDefinition.Patches) {
-        [byte[]]$replace = Hex-ToBytes $p.New
-        if ($p.Offset + $replace.Length -gt $Data.Length) { throw "Experimental patch offset outside executable at 0x$($p.Offset.ToString('X'))." }
         [Array]::Copy($replace, 0, $Data, $p.Offset, $replace.Length)
     }
     Write-Output -NoEnumerate $Data
@@ -791,6 +792,7 @@ function Refresh-Status {
     $script:CurrentHash = $null
     $script:CurrentState = 'none'
     $script:CurrentDevState = 'missing'
+    $script:PatchDefinition = $null
 
     # Important button behavior: Restore is NEVER enabled before a successful/recognized patch.
     # Enable is disabled as soon as the EXE is recognized as patched.
@@ -830,8 +832,13 @@ function Refresh-Status {
         $script:CurrentState = if ($probe) { $probe.State } else { 'incompatible' }
         switch ($script:CurrentState) {
             'original-compatible' {
-                Set-Value $patchValue 'Compatible — ready to unlock 5X/6X' $accent
-                $install.Enabled = $true
+                if (Test-TrustedPatch $probe $versionInfo $script:CurrentHash) {
+                    Set-Value $patchValue 'Verified original EXE — ready to unlock 5X/6X' $accent
+                    $install.Enabled = $true
+                } else {
+                    Set-Value $patchValue 'Unverified VERSION or SHA-256 — patch blocked' $amber
+                    $install.Enabled = $false
+                }
             }
             'patched-compatible' {
                 Set-Value $patchValue 'Enabled — native 5X/6X menu unlocked' $accent
@@ -846,8 +853,8 @@ function Refresh-Status {
             default {
                 $match = if ($probe) { $probe } else { Get-PatchMatchSummary $script:CurrentExe }
                 $template = if ($script:PatchDefinition.Version) { $script:PatchDefinition.Version } else { 'unknown' }
-                Set-Value $patchValue ("Unknown layout — best template {0}: {1}/{2} signatures match; EXPERIMENTAL attempt available" -f $template,$match.Old,$match.Total) $amber
-                $install.Enabled = (Test-BasicPeFile $script:CurrentExe)
+                Set-Value $patchValue ("Unknown layout — best template {0}: {1}/{2} signatures match; patch BLOCKED (updated layout required)" -f $template,$match.Old,$match.Total) $amber
+                $install.Enabled = $false
             }
         }
         if (Test-Path -LiteralPath "$script:CurrentExe.mfg56.bak" -PathType Leaf) { $restore.Enabled = $true }
@@ -997,14 +1004,10 @@ $install.Add_Click({
         [Windows.Forms.MessageBox]::Show('This executable is already patched or partially patched. Restore the original before enabling again.',$AppName,[Windows.Forms.MessageBoxButtons]::OK,[Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
         return
     }
-    $forceMode = ($script:CurrentState -eq 'incompatible')
-    if ($forceMode) {
-        $match = Get-PatchMatchSummary $script:CurrentExe
-        $warning = "This game build does NOT match the tested patch layout.`r`n`r`nThe unlocker can still TRY the closest embedded patch layout at its known offsets. This is EXPERIMENTAL and may make the game fail to start if GIANTS changed those areas.`r`n`r`nA byte-for-byte backup of FarmingSimulator2025Game.exe will be created first, and RESTORE ORIGINAL will remain available.`r`n`r`nSelected template: $($script:PatchDefinition.Version).`r`nDetected original signatures: $($match.Old)/$($match.Total).`r`n`r`nTry anyway?"
-        $r = [Windows.Forms.MessageBox]::Show($warning,$AppName,[Windows.Forms.MessageBoxButtons]::YesNo,[Windows.Forms.MessageBoxIcon]::Warning)
-        if ($r -ne [Windows.Forms.DialogResult]::Yes) { return }
-    } elseif ($script:CurrentState -ne 'original-compatible') {
-        [Windows.Forms.MessageBox]::Show('The selected file cannot be patched.',$AppName,[Windows.Forms.MessageBoxButtons]::OK,[Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+    $preflightProbe = Select-BestPatchDefinition $script:CurrentExe
+    $preflightVersion = Get-GameVersionInfo $script:CurrentExe
+    if (-not (Test-TrustedPatch $preflightProbe $preflightVersion (Get-SHA256 $script:CurrentExe))) {
+        [Windows.Forms.MessageBox]::Show('This FS25 executable is not a verified supported build. No files were modified. Do not force an older patch layout onto this version.',$AppName,[Windows.Forms.MessageBoxButtons]::OK,[Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
         return
     }
     if (-not $script:CurrentGameXml) {
@@ -1034,20 +1037,16 @@ $install.Add_Click({
     $xmlWritten = $false
     try {
         Log-Line 'Running executable compatibility check...' $blue
+        # Recheck version, full signature set and exact SHA-256 immediately before backup/write.
+        # The GUI/preflight checks are not sufficient if the executable changes meanwhile.
         $beforeHash = Get-SHA256 $script:CurrentExe
-        $liveState = Get-PatchLayoutState $script:CurrentExe
-        if ($forceMode) {
-            if ($liveState -ne 'incompatible') { throw 'Executable state changed since scan. Please scan again.' }
-            Log-Line 'EXPERIMENTAL MODE: layout mismatch accepted by user; closest embedded patch offsets will be attempted.' $amber
-        } else {
-            if ($liveState -ne 'original-compatible') { throw 'Executable changed since scan. Please scan again.' }
-        }
-
         $versionInfo = Get-GameVersionInfo $script:CurrentExe
-        if (-not $versionInfo.Version -or $versionInfo.Version -ne $TestedVersion) {
-            if ($forceMode) { Log-Line 'Untested game build: forced closest-layout patch attempt selected. Creating exact backups first.' $amber }
-            else { Log-Line 'Untested game build: required patch-byte layout matches. Proceeding with backups.' $amber }
+        $liveProbe = Select-BestPatchDefinition $script:CurrentExe
+        if (-not (Test-TrustedPatch $liveProbe $versionInfo $beforeHash)) {
+            throw 'Executable changed or is not an explicitly verified build. No patch written.'
         }
+        $script:PatchDefinition = $liveProbe.Definition
+        Log-Line ("Verified original FS25 build {0}; exact SHA-256 and all patch bytes match." -f $versionInfo.Version) $accent
 
         $exeBak = "$script:CurrentExe.mfg56.bak"
         [void](Backup-CurrentFile $script:CurrentExe $exeBak)
@@ -1058,14 +1057,14 @@ $install.Add_Click({
         Log-Line 'Exact pre-patch game.xml backup created and hash recorded.' $accent
 
         [byte[]]$data = [IO.File]::ReadAllBytes($script:CurrentExe)
-        if ($forceMode) { $data = Apply-PatchBytesForce $data }
-        else { $data = Apply-PatchBytes $data $true }
+        $data = Apply-PatchBytes $data $true
         [IO.File]::WriteAllBytes($exeTmp, $data)
         if ((Get-PatchLayoutState $exeTmp) -ne 'patched-compatible') { throw 'Patched executable validation failed.' }
 
         Write-DevControlsUnlock $script:CurrentGameXml $xmlTmp
         if ((Get-DevControlsState $xmlTmp) -ne 'enabled') { throw 'Development-controls game.xml validation failed.' }
 
+        if ((Get-SHA256 $script:CurrentExe) -ne $beforeHash) { throw 'Game EXE changed during patch preparation. No patch written.' }
         Copy-Item -LiteralPath $exeTmp -Destination $script:CurrentExe -Force
         $exeWritten = $true
         Copy-Item -LiteralPath $xmlTmp -Destination $script:CurrentGameXml -Force
@@ -1075,7 +1074,7 @@ $install.Add_Click({
 
         Remove-Item -LiteralPath $exeTmp -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $xmlTmp -Force -ErrorAction SilentlyContinue
-        if ($forceMode) { Log-Line 'SUCCESS: experimental forced patch written; 5X/6X and development controls enabled. Test the game; RESTORE ORIGINAL is available.' $accent } else { Log-Line 'SUCCESS: 5X/6X unlocked and development controls enabled.' $accent }
+        Log-Line 'SUCCESS: verified 5X/6X patch written and development controls enabled.' $accent
         Refresh-Status
         $gpuFamily = Get-GpuFamily $script:CurrentGpu
         $bridgeMissing = $false
