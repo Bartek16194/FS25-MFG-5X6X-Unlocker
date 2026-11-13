@@ -76,7 +76,7 @@ The executable currently contains embedded patch layouts for:
 
 The game build displayed in the GUI is read from the game's `VERSION` file; the actual patch layout is selected by checking the executable bytes. GIANTS moved several relevant functions and globals between builds, so each known layout is validated before patching.
 
-There is intentionally no hard version-number lock. Unknown future builds can still use the EXPERIMENTAL path after an exact backup is created.
+**Safety gate:** patching requires a known FS25 VERSION, a matching original executable SHA-256, and an exact match for every embedded patch signature. Unknown builds are displayed for diagnostics but cannot be patched.
 
 ## Backups and Restore Original
 
@@ -88,7 +88,7 @@ The tool can restore:
 - the original `game.xml`,
 - an Ada `version.dll` installed through this utility, including restoration of a previously existing DLL when applicable.
 
-Game updates can replace the patched executable. If that happens, simply run the latest unlocker again after verifying that the new FS25 build is supported by the compatibility scan.
+Game updates can replace the patched executable. Before reapplying, the updated executable must have its own verified layout and known SHA-256 in the unlocker; do not force an older layout.
 
 ## If 5X and 6X both behave like 6X
 
@@ -178,12 +178,13 @@ Do not upload copyrighted GIANTS executables to a public issue.
 GitHub: https://github.com/Bartek16194
 
 
-## Experimental support for unknown builds
+## Unknown builds: fail closed
 
-If a newer Farming Simulator 25 build no longer exactly matches an embedded layout, the unlocker shows how many signatures match and selects the **closest known template** for an optional EXPERIMENTAL attempt.
+Unknown game builds can be scanned for diagnostic purposes, but **ENABLE stays disabled**. No experimental forced offset writes are offered. A compatible build must match a declared VERSION, SHA-256 of the unmodified EXE, and all known original patch bytes before any modification.
 
-This may work when GIANTS changed unrelated code, but it can still make the game fail to start when the relevant functions moved. Before any experimental write, the tool creates a byte-for-byte backup and records its SHA-256. **RESTORE ORIGINAL** restores that exact pre-patch file.
+**FS25 1.25.1.0 is not supported by the bundled 1.19/1.20/1.21 layouts.** An older forced-layout attempt on 1.25.1.0 was observed to cause Steam error 51; restoring the byte-for-byte prepatch backup restored startup. Do not add a 1.25.1.0 entry until a new layout and exact original EXE hash have been independently verified. Never redistribute proprietary GIANTS executable files.
 
+The normal backup/restore functionality is preserved for previously patched installations. Source regression tests run on Windows in GitHub Actions before the standalone EXE is rebuilt.
 
 ## FS25 1.21 support
 

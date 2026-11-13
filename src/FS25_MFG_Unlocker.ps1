@@ -291,6 +291,16 @@ function Get-PatchMatchSummary([string]$ExePath) {
     return @{ Old=$oldCount; New=$newCount; Unknown=$unknownCount; Total=$total }
 }
 
+# Refuse to patch anything except a byte-for-byte known original executable.
+# A partial signature match is diagnostic only, never permission to write.
+function Test-TrustedPatch($Probe, $VersionInfo, [string]$ExeHash) {
+    if (-not $Probe -or $Probe.State -ne 'original-compatible' -or -not $Probe.Definition) { return $false }
+    if (-not $VersionInfo -or [string]::IsNullOrWhiteSpace($VersionInfo.Version)) { return $false }
+    if ([string]::IsNullOrWhiteSpace($ExeHash) -or [string]::IsNullOrWhiteSpace($Probe.Definition.OriginalHash)) { return $false }
+    return ($VersionInfo.Version -eq $Probe.Definition.Version -and
+            $ExeHash -eq $Probe.Definition.OriginalHash)
+}
+
 function Test-BasicPeFile([string]$ExePath) {
     try {
         [byte[]]$head = New-Object byte[] 64
@@ -341,13 +351,59 @@ function Apply-PatchBytes([byte[]]$Data, [bool]$Forward) {
     Write-Output -NoEnumerate $Data
 }
 
-function Apply-PatchBytesForce([byte[]]$Data) {
-    foreach ($p in $script:PatchDefinition.Patches) {
-        [byte[]]$replace = Hex-ToBytes $p.New
-        if ($p.Offset + $replace.Length -gt $Data.Length) { throw "Experimental patch offset outside executable at 0x$($p.Offset.ToString('X'))." }
-        [Array]::Copy($replace, 0, $Data, $p.Offset, $replace.Length)
+# Hash in-memory bytes without a second path-based file open.
+function Get-BytesSHA256([byte[]]$Data) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($Data))).Replace('-','') }
+    finally { $sha.Dispose() }
+}
+
+# Hold an exclusive handle from the identity check through the final write.
+# If the write fails, restore exactly the bytes read under the SAME lock.
+# This avoids the hash-then-Copy-Item race with a Steam update.
+function Write-VerifiedLockedFile([string]$Target, [string]$ExpectedHash, [byte[]]$Replacement) {
+    if (-not $Replacement -or [string]::IsNullOrWhiteSpace($ExpectedHash)) {
+        throw 'Verified write requires an expected SHA-256 and nonempty replacement bytes.'
     }
-    Write-Output -NoEnumerate $Data
+    $stream = [IO.File]::Open($Target, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try {
+        if ($stream.Length -gt [int]::MaxValue) { throw 'Target file is too large for verified write.' }
+        [byte[]]$original = New-Object byte[] ([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $original.Length) {
+            $count = $stream.Read($original, $offset, $original.Length - $offset)
+            if ($count -le 0) { throw 'Cannot read target through exclusive file handle.' }
+            $offset += $count
+        }
+        if ((Get-BytesSHA256 $original) -ne $ExpectedHash.ToUpperInvariant()) {
+            throw 'Target changed before exclusive write. No changes were made.'
+        }
+        $replacementHash = Get-BytesSHA256 $Replacement
+        try {
+            $stream.Position = 0
+            $stream.SetLength($Replacement.Length)
+            $stream.Write($Replacement, 0, $Replacement.Length)
+            $stream.Flush($true)
+            $stream.Position = 0
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            try { $writtenHash = ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-','') }
+            finally { $sha.Dispose() }
+            if ($writtenHash -ne $replacementHash) { throw 'Written file checksum mismatch.' }
+        } catch {
+            $writeError = $_.Exception.Message
+            try {
+                $stream.Position = 0
+                $stream.SetLength($original.Length)
+                $stream.Write($original, 0, $original.Length)
+                $stream.Flush($true)
+            } catch {
+                throw "Write failed ($writeError). In-handle restore FAILED; use verified backup: $($_.Exception.Message)"
+            }
+            throw "Write failed and original bytes restored: $writeError"
+        }
+    } finally {
+        $stream.Dispose()
+    }
 }
 
 function Backup-CurrentFile([string]$Source, [string]$Backup) {
@@ -791,6 +847,7 @@ function Refresh-Status {
     $script:CurrentHash = $null
     $script:CurrentState = 'none'
     $script:CurrentDevState = 'missing'
+    $script:PatchDefinition = $null
 
     # Important button behavior: Restore is NEVER enabled before a successful/recognized patch.
     # Enable is disabled as soon as the EXE is recognized as patched.
@@ -830,8 +887,13 @@ function Refresh-Status {
         $script:CurrentState = if ($probe) { $probe.State } else { 'incompatible' }
         switch ($script:CurrentState) {
             'original-compatible' {
-                Set-Value $patchValue 'Compatible — ready to unlock 5X/6X' $accent
-                $install.Enabled = $true
+                if (Test-TrustedPatch $probe $versionInfo $script:CurrentHash) {
+                    Set-Value $patchValue 'Verified original EXE — ready to unlock 5X/6X' $accent
+                    $install.Enabled = $true
+                } else {
+                    Set-Value $patchValue 'Unverified VERSION or SHA-256 — patch blocked' $amber
+                    $install.Enabled = $false
+                }
             }
             'patched-compatible' {
                 Set-Value $patchValue 'Enabled — native 5X/6X menu unlocked' $accent
@@ -846,8 +908,8 @@ function Refresh-Status {
             default {
                 $match = if ($probe) { $probe } else { Get-PatchMatchSummary $script:CurrentExe }
                 $template = if ($script:PatchDefinition.Version) { $script:PatchDefinition.Version } else { 'unknown' }
-                Set-Value $patchValue ("Unknown layout — best template {0}: {1}/{2} signatures match; EXPERIMENTAL attempt available" -f $template,$match.Old,$match.Total) $amber
-                $install.Enabled = (Test-BasicPeFile $script:CurrentExe)
+                Set-Value $patchValue ("Unknown layout — best template {0}: {1}/{2} signatures match; patch BLOCKED (updated layout required)" -f $template,$match.Old,$match.Total) $amber
+                $install.Enabled = $false
             }
         }
         if (Test-Path -LiteralPath "$script:CurrentExe.mfg56.bak" -PathType Leaf) { $restore.Enabled = $true }
@@ -997,14 +1059,10 @@ $install.Add_Click({
         [Windows.Forms.MessageBox]::Show('This executable is already patched or partially patched. Restore the original before enabling again.',$AppName,[Windows.Forms.MessageBoxButtons]::OK,[Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
         return
     }
-    $forceMode = ($script:CurrentState -eq 'incompatible')
-    if ($forceMode) {
-        $match = Get-PatchMatchSummary $script:CurrentExe
-        $warning = "This game build does NOT match the tested patch layout.`r`n`r`nThe unlocker can still TRY the closest embedded patch layout at its known offsets. This is EXPERIMENTAL and may make the game fail to start if GIANTS changed those areas.`r`n`r`nA byte-for-byte backup of FarmingSimulator2025Game.exe will be created first, and RESTORE ORIGINAL will remain available.`r`n`r`nSelected template: $($script:PatchDefinition.Version).`r`nDetected original signatures: $($match.Old)/$($match.Total).`r`n`r`nTry anyway?"
-        $r = [Windows.Forms.MessageBox]::Show($warning,$AppName,[Windows.Forms.MessageBoxButtons]::YesNo,[Windows.Forms.MessageBoxIcon]::Warning)
-        if ($r -ne [Windows.Forms.DialogResult]::Yes) { return }
-    } elseif ($script:CurrentState -ne 'original-compatible') {
-        [Windows.Forms.MessageBox]::Show('The selected file cannot be patched.',$AppName,[Windows.Forms.MessageBoxButtons]::OK,[Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+    $preflightProbe = Select-BestPatchDefinition $script:CurrentExe
+    $preflightVersion = Get-GameVersionInfo $script:CurrentExe
+    if (-not (Test-TrustedPatch $preflightProbe $preflightVersion (Get-SHA256 $script:CurrentExe))) {
+        [Windows.Forms.MessageBox]::Show('This FS25 executable is not a verified supported build. No files were modified. Do not force an older patch layout onto this version.',$AppName,[Windows.Forms.MessageBoxButtons]::OK,[Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
         return
     }
     if (-not $script:CurrentGameXml) {
@@ -1034,21 +1092,18 @@ $install.Add_Click({
     $xmlWritten = $false
     try {
         Log-Line 'Running executable compatibility check...' $blue
+        # Recheck version, full signature set and exact SHA-256 immediately before backup/write.
+        # The GUI/preflight checks are not sufficient if the executable changes meanwhile.
         $beforeHash = Get-SHA256 $script:CurrentExe
-        $liveState = Get-PatchLayoutState $script:CurrentExe
-        if ($forceMode) {
-            if ($liveState -ne 'incompatible') { throw 'Executable state changed since scan. Please scan again.' }
-            Log-Line 'EXPERIMENTAL MODE: layout mismatch accepted by user; closest embedded patch offsets will be attempted.' $amber
-        } else {
-            if ($liveState -ne 'original-compatible') { throw 'Executable changed since scan. Please scan again.' }
-        }
-
         $versionInfo = Get-GameVersionInfo $script:CurrentExe
-        if (-not $versionInfo.Version -or $versionInfo.Version -ne $TestedVersion) {
-            if ($forceMode) { Log-Line 'Untested game build: forced closest-layout patch attempt selected. Creating exact backups first.' $amber }
-            else { Log-Line 'Untested game build: required patch-byte layout matches. Proceeding with backups.' $amber }
+        $liveProbe = Select-BestPatchDefinition $script:CurrentExe
+        if (-not (Test-TrustedPatch $liveProbe $versionInfo $beforeHash)) {
+            throw 'Executable changed or is not an explicitly verified build. No patch written.'
         }
+        $script:PatchDefinition = $liveProbe.Definition
+        Log-Line ("Verified original FS25 build {0}; exact SHA-256 and all patch bytes match." -f $versionInfo.Version) $accent
 
+        $beforeXmlHash = Get-SHA256 $script:CurrentGameXml
         $exeBak = "$script:CurrentExe.mfg56.bak"
         [void](Backup-CurrentFile $script:CurrentExe $exeBak)
         Log-Line 'Exact pre-patch executable backup created and hash recorded.' $accent
@@ -1058,24 +1113,30 @@ $install.Add_Click({
         Log-Line 'Exact pre-patch game.xml backup created and hash recorded.' $accent
 
         [byte[]]$data = [IO.File]::ReadAllBytes($script:CurrentExe)
-        if ($forceMode) { $data = Apply-PatchBytesForce $data }
-        else { $data = Apply-PatchBytes $data $true }
+        $data = Apply-PatchBytes $data $true
         [IO.File]::WriteAllBytes($exeTmp, $data)
         if ((Get-PatchLayoutState $exeTmp) -ne 'patched-compatible') { throw 'Patched executable validation failed.' }
 
         Write-DevControlsUnlock $script:CurrentGameXml $xmlTmp
         if ((Get-DevControlsState $xmlTmp) -ne 'enabled') { throw 'Development-controls game.xml validation failed.' }
 
-        Copy-Item -LiteralPath $exeTmp -Destination $script:CurrentExe -Force
-        $exeWritten = $true
-        Copy-Item -LiteralPath $xmlTmp -Destination $script:CurrentGameXml -Force
+        # Validate backups before either guarded write. Apply XML first so an EXE write
+        # is never followed by another required, unguarded file replacement.
+        if ((Get-SHA256 $exeBak) -ne $beforeHash -or (Get-SHA256 $xmlBak) -ne $beforeXmlHash) {
+            throw 'Pre-patch backups do not match verified input files.'
+        }
+        $patchedExeHash = Get-SHA256 $exeTmp
+        $patchedXmlHash = Get-SHA256 $xmlTmp
+        Write-VerifiedLockedFile $script:CurrentGameXml $beforeXmlHash ([IO.File]::ReadAllBytes($xmlTmp))
         $xmlWritten = $true
+        Write-VerifiedLockedFile $script:CurrentExe $beforeHash ([IO.File]::ReadAllBytes($exeTmp))
+        $exeWritten = $true
         if ((Get-PatchLayoutState $script:CurrentExe) -ne 'patched-compatible') { throw 'Final executable verification failed.' }
         if ((Get-DevControlsState $script:CurrentGameXml) -ne 'enabled') { throw 'Final game.xml verification failed.' }
 
         Remove-Item -LiteralPath $exeTmp -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $xmlTmp -Force -ErrorAction SilentlyContinue
-        if ($forceMode) { Log-Line 'SUCCESS: experimental forced patch written; 5X/6X and development controls enabled. Test the game; RESTORE ORIGINAL is available.' $accent } else { Log-Line 'SUCCESS: 5X/6X unlocked and development controls enabled.' $accent }
+        Log-Line 'SUCCESS: verified 5X/6X patch written and development controls enabled.' $accent
         Refresh-Status
         $gpuFamily = Get-GpuFamily $script:CurrentGpu
         $bridgeMissing = $false
@@ -1092,13 +1153,18 @@ $install.Add_Click({
     } catch {
         Remove-Item -LiteralPath $exeTmp -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $xmlTmp -Force -ErrorAction SilentlyContinue
-        # Best-effort rollback only for files actually replaced during this attempt.
-        try {
-            $exeBak = "$script:CurrentExe.mfg56.bak"
-            if ($exeWritten -and (Test-Path -LiteralPath $exeBak)) { Copy-Item -LiteralPath $exeBak -Destination $script:CurrentExe -Force }
-            $xmlBak = "$script:CurrentGameXml.mfg56.bak"
-            if ($xmlWritten -and (Test-Path -LiteralPath $xmlBak)) { Copy-Item -LiteralPath $xmlBak -Destination $script:CurrentGameXml -Force }
-        } catch {}
+        # Never roll back over an updater's newer file. Only restore our exact
+        # recorded output under an exclusive lock; otherwise leave it untouched.
+        if ($exeWritten -and (Test-Path -LiteralPath "$script:CurrentExe.mfg56.bak")) {
+            try {
+                Write-VerifiedLockedFile $script:CurrentExe $patchedExeHash ([IO.File]::ReadAllBytes("$script:CurrentExe.mfg56.bak"))
+            } catch { Log-Line ("EXE rollback skipped/failed: " + $_.Exception.Message) $red }
+        }
+        if ($xmlWritten -and (Test-Path -LiteralPath "$script:CurrentGameXml.mfg56.bak")) {
+            try {
+                Write-VerifiedLockedFile $script:CurrentGameXml $patchedXmlHash ([IO.File]::ReadAllBytes("$script:CurrentGameXml.mfg56.bak"))
+            } catch { Log-Line ("game.xml rollback skipped/failed: " + $_.Exception.Message) $red }
+        }
         Log-Line ("ERROR: " + $_.Exception.Message) $red
         Refresh-Status
         [Windows.Forms.MessageBox]::Show($_.Exception.Message,$AppName,[Windows.Forms.MessageBoxButtons]::OK,[Windows.Forms.MessageBoxIcon]::Error) | Out-Null

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased — safety hardening
+- Remove unsafe forced-offset patching for unknown FS25 builds.
+- Require exact game VERSION, original EXE SHA-256, and full byte-layout match before every EXE write.
+- Keep backup and Restore Original behavior; detect executable changes during patch preparation.
+- Add regression tests to the Windows build workflow.
+- FS25 1.25.1.0 is not supported until its layout is independently validated.
+
 ## 1.0.0
 - Initial public release.
 - Unlocks DLSS Multi Frame Generation 5X and 6X directly in the Farming Simulator 25 graphics menu.
